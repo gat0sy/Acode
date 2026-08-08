@@ -163,7 +163,10 @@ function createWebSocketTransport(
 
 interface WorkspaceEditParam {
 	changes?: Record<string, TextEdit[]>;
-	documentChanges?: Array<{ textDocument: { uri: string }; edits: TextEdit[] }>;
+	documentChanges?: Array< 
+	| { textDocument: { uri: string }; edits: TextEdit[] }
+	| { kind: "create" | "rename" | "delete"; uri: string
+	}>;
 }
 
 async function applyWorkspaceEditToContext(
@@ -172,14 +175,38 @@ async function applyWorkspaceEditToContext(
 ): Promise<{ applied: boolean; failureReason?: string }> {
 	if (!edit) return { applied: false, failureReason: "No edit provided" };
 
-	const changesByUri: Record<string, TextEdit[]> =
-		edit.changes ??
-		Object.fromEntries(
-			(edit.documentChanges ?? [])
-				.filter((c): c is { textDocument: { uri: string }; edits: TextEdit[] } => "edits" in c)
-				.map((c) => [c.textDocument.uri, c.edits]),
-		);
+	// Reject resource operations explicitly
+  const resourceOps = (edit.documentChanges ?? []).filter(
+    (c): c is {
+      kind: "create" | "rename" | "delete"; uri: string
+    } => "kind" in c,);
+    
+  if (resourceOps.length > 0) {
+    return {
+      applied: false,
+      failureReason: `Resource operations not supported: ${resourceOps.map((o) => o.kind).join(", ")}`,
+    };
+  }
 
+  // Accumulate edits per URI (don't overwrite duplicates)
+  const changesByUri: Record < string,
+  TextEdit[] > = {};
+  if (edit.changes) {
+    for (const [uri, edits] of Object.entries(edit.changes)) {
+      changesByUri[uri] = [...(changesByUri[uri] ?? []),
+        ...edits];
+    }
+  }
+  if (edit.documentChanges) {
+    for (const change of edit.documentChanges) {
+      if ("edits" in change) {
+        const uri = change.textDocument.uri;
+        changesByUri[uri] = [...(changesByUri[uri] ?? []),
+          ...change.edits];
+      }
+    }
+  }
+  
 	const uris = Object.keys(changesByUri);
 	if (!uris.length) {
 		return { applied: false, failureReason: "Edit contains no changes" };
@@ -192,6 +219,10 @@ async function applyWorkspaceEditToContext(
 	if (!workspace) {
 		return { applied: false, failureReason: "No workspace available to apply edit" };
 	}
+	// Workspace boundary check
+  const allowedRoots = [ctx.rootUri,
+    ctx.originalRootUri].filter(
+    (r): r is string => !!r,);
 
 	let appliedCount = 0;
 	const failures: string[] = [];
@@ -199,6 +230,17 @@ async function applyWorkspaceEditToContext(
 	for (const uri of uris) {
 		const edits = changesByUri[uri];
 		if (!edits.length) continue;
+		
+		// Security: reject edits outside workspace roots
+    const inWorkspace =
+    !allowedRoots.length ||
+    allowedRoots.some(
+      (root) => uri === root || uri.startsWith(`${root}/`),
+    );
+    if (!inWorkspace) {
+      failures.push(uri);
+      continue;
+    }
 
 		let view = workspace.getFile(uri)?.getView();
 		if (!view) {
@@ -213,8 +255,16 @@ async function applyWorkspaceEditToContext(
 			failures.push(uri);
 			continue;
 		}
+		
+		// Find the plugin belonging to THIS server, not just any plugin
+    const allPlugins = LSPPlugin.getAll(view);
+    const plugin =
+    allPlugins.find(
+      (p) => (p.client as {
+        __acodeServerId?: string
+      }).__acodeServerId === server.id,
+    ) ?? allPlugins[0];
 
-		const plugin = LSPPlugin.get(view);
 		if (!plugin) {
 			failures.push(uri);
 			continue;
